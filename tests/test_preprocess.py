@@ -35,7 +35,7 @@ def test_format_age():
 # ---------- Processed data ----------
 
 @pytest.fixture
-def  ():
+def clean_events():
     if not CLEAN_PATH.exists():
         pytest.skip("Run scripts/preprocess.py first")
     with open(CLEAN_PATH, encoding="utf-8") as f:
