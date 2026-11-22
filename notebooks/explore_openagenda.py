@@ -1,5 +1,28 @@
 """Exploration of the OpenAgenda API (draft). 
 The clean code is in scripts/."""
+# %%
+import requests, pandas as pd
+from datetime import datetime, timedelta
+def fetch_events(city: str, api_key: str) -> pd.DataFrame:
+    base_url = 'https://api.openagenda.com/v2/events'
+    one_year_ago = (datetime.now() - timedelta(days=365)).isoformat()
+    all_events, after = [], None
+    while True:
+        params = {
+            'key': api_key,
+            'size': 100,
+            'city[]': city,
+            'after[timings.end]': one_year_ago,
+            **(({'after': after}) if after else {})
+        }
+        resp = requests.get(base_url, params=params)
+        data = resp.json()
+        events = data.get('events', [])
+        if not events: break
+        all_events.extend(events)
+        after = data.get('after') # Token de pagination
+    return pd.DataFrame(all_events)
+
 
 # %% 1. Load the API key from .env
 import json
@@ -15,6 +38,8 @@ api_key = os.getenv("OPENAGENDA_API_KEY")
 BASE_URL = "https://api.openagenda.com/v2"
 
 print("API key loaded:", api_key is not None)
+
+print(fetch_events("Toulouse", api_key))
 
 # %% 2. First call: search agendas, look at the raw response
 resp = requests.get(
@@ -299,3 +324,192 @@ with open(Path("../data/raw/events.json"), encoding="utf-8") as f:
 
 print("Events loaded:", len(raw_events))
 print("'longDescription' in first event:", "longDescription" in raw_events[0])
+
+# %% 13. Load the raw file and look at the candidate fields of one event
+import json
+from pathlib import Path
+
+print("Current folder:", Path.cwd())          # to understand the relative path below
+
+with open(Path("../data/raw/events.json"), encoding="utf-8") as f:
+    raw_events = json.load(f)
+print("Events loaded:", len(raw_events))
+
+event = raw_events[0]
+candidates = ["uid", "title", "description", "longDescription", "keywords",
+              "dateRange", "firstTiming", "lastTiming", "location",
+              "attendanceMode", "canonicalUrl", "status"]
+
+for field in candidates:
+    value = event.get(field)
+    print(f"\n=== {field} ({type(value).__name__}) ===")
+    print(str(value)[:300])                   # only the first 300 characters
+
+
+
+
+# %% 14. All fields of the raw file: how often filled + one example
+all_keys = set()
+for event in raw_events:
+    for key in event.keys():
+        all_keys.add(key)                  # collect every field name seen
+
+for key in sorted(all_keys):
+    filled = 0
+    example = None
+    for event in raw_events:
+        value = event.get(key)
+        if value not in (None, "", [], {}):   # "filled" = not empty
+            filled += 1
+            if example is None:
+                example = value
+    print(f"{key:20} {filled:5}/{len(raw_events)}  {str(example)[:70]}")
+
+# %% A. Get text: French first, otherwise any available language
+def get_text(multilang):
+    """Return the 'fr' text, else the first non-empty text, else ''."""
+    if not multilang:
+        return ""
+    if multilang.get("fr"):
+        return multilang["fr"]
+    for value in multilang.values():
+        if value:
+            return value
+    return ""
+
+print(get_text({"fr": "Bonjour"}))           # -> Bonjour
+print(get_text({"en": "Texte rangé en en"}))  # -> Texte rangé en en
+print(repr(get_text(None)))                   # -> ''
+
+get_text({"fr": "", "de" : "Hallo", "es": "Holà"})
+# %% B. Is there Markdown in longDescription?
+text = get_text(raw_events[0].get("longDescription"))
+print(repr(text[:400]))     # repr shows the raw string, symbols included
+# %% B bis. Clean Markdown 
+import re
+
+def clean_markdown(text):
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)  # [text](url) -> text
+    text = re.sub(r"https?://\S+", "", text)               # bare URLs -> removed
+    text = re.sub(r"[#*_>`]", "", text)                    # Markdown symbols
+    text = re.sub(r"\s+", " ", text)                       # many spaces/lines -> one space
+    return text.strip()
+
+sample = "### Infos\n**Gratuit** ! Réservez [ici](https://exemple.fr) ou https://x.fr"
+print("Text with Markdown to be removed: \n", sample)
+print("\nCleaned text: \n", clean_markdown(sample))
+
+# %% C. Flatten one raw event into one clean row
+def flatten_event(event):
+    location = event.get("location") or {}
+    keywords = (event.get("keywords") or {}).get("fr") or []
+    return {
+        "uid": event.get("uid"),
+        "title": get_text(event.get("title")),
+        "description": get_text(event.get("description")),
+        "long_description": clean_markdown(get_text(event.get("longDescription"))),
+        "keywords": ", ".join(keywords),
+        "date_range": get_text(event.get("dateRange")),
+        "first_date": (event.get("firstTiming") or {}).get("begin"),
+        "last_date": (event.get("lastTiming") or {}).get("end"),
+        "location_name": location.get("name"),
+        "address": location.get("address"),
+        "city": location.get("city"),
+        "url": event.get("canonicalUrl"),
+    }
+
+print("Text to flatten :", raw_events[0])
+row = flatten_event(raw_events[0])
+for key, value in row.items():
+    print(f"{key:17}: {str(value)[:80]}")
+
+# %% D. Clean all events, check quality, save
+import pandas as pd
+
+rows = []
+for event in raw_events:
+    rows.append(flatten_event(event))
+df = pd.DataFrame(rows)
+
+print("Rows              :", len(df))
+print("Duplicate uids    :", df["uid"].duplicated().sum())
+print("Empty title       :", (df["title"] == "").sum())
+print("Empty long desc   :", (df["long_description"] == "").sum())
+print("Cities            :", df["city"].value_counts().head(5).to_dict())
+
+output = Path("../data/processed/events_clean.json")
+output.parent.mkdir(parents=True, exist_ok=True)
+df.to_json(output, orient="records", force_ascii=False, indent=2)
+print("Saved to", output.resolve())
+
+# %% E. Build one text per event (what the chatbot will search in)
+def build_text(row):
+    parts = [
+        f"Titre : {row['title']}",
+        f"Dates : {row['date_range']}",
+        f"Lieu : {row['location_name']}, {row['address']}",
+        f"Mots-clés : {row['keywords']}",
+        f"Résumé : {row['description']}",
+        f"Description : {row['long_description']}",
+    ]
+    return "\n".join(parts)
+
+df["text"] = df.apply(build_text, axis=1)
+print(df["text"].iloc[0][:500])
+# %% F. How long are the texts? (to choose a chunk size)
+lengths = df["text"].str.len()
+print(lengths.describe().round())
+print("Texts longer than 1000 chars:", (lengths > 1000).sum())
+
+# %% G. Split long texts into chunks
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+
+long_text = df.loc[lengths.idxmax(), "text"]      # the longest event
+chunks = splitter.split_text(long_text)
+print("Number of chunks:", len(chunks))
+print("\n--- Chunk 2 ---\n", chunks[1][:300])
+
+# %% Test the Mistral key
+import os
+from dotenv import load_dotenv
+from mistralai.client import Mistral
+
+load_dotenv(override=True)                 # reload .env (the file changed)
+client = Mistral(api_key=os.getenv("MISTRAL_API_KEY"))
+
+response = client.chat.complete(
+    model="mistral-small-2603",
+    messages=[{"role": "user", "content": "Dis bonjour en une phrase."}],
+)
+print(response.choices[0].message.content)
+# %% H. Split only the description, then put the header back on every chunk
+def build_header(row):
+    return (f"Titre : {row['title']}\n"
+            f"Dates : {row['date_range']}\n"
+            f"Lieu : {row['location_name']}, {row['address']}\n"
+            f"Mots-clés : {row['keywords']}")
+
+row = df.loc[lengths.idxmax()]               # the same longest event as in G
+print(build_header(row))
+
+def build_chunks(row):
+    header = build_header(row)
+    body = f"Résumé : {row['description']}\nDescription : {row['long_description']}"
+    pieces = splitter.split_text(body)       # split ONLY the body
+    chunks = []
+    for piece in pieces:
+        chunks.append(header + "\n" + piece) # glue the header in front of each piece
+    return chunks
+
+chunks = build_chunks(row)
+print("Number of chunks:", len(chunks))
+print("\n--- Chunk 2 ---\n", chunks[1][:400])
+# %% Overlap demo
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+text = "Concert de jazz au Sunset. Entrée gratuite pour les moins de 26 ans, sur réservation."
+for overlap in [0, 20]:
+    demo = RecursiveCharacterTextSplitter(chunk_size=40, chunk_overlap=overlap)
+    print(f"overlap={overlap}:", demo.split_text(text))
+# %%
