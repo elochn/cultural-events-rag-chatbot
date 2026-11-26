@@ -506,10 +506,132 @@ def build_chunks(row):
 chunks = build_chunks(row)
 print("Number of chunks:", len(chunks))
 print("\n--- Chunk 2 ---\n", chunks[1][:400])
-# %% Overlap demo
+# %% I. Overlap demo
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 text = "Concert de jazz au Sunset. Entrée gratuite pour les moins de 26 ans, sur réservation."
 for overlap in [0, 20]:
     demo = RecursiveCharacterTextSplitter(chunk_size=40, chunk_overlap=overlap)
     print(f"overlap={overlap}:", demo.split_text(text))
-# %%
+# %% J. See embeddings: similar meanings -> high score
+from langchain_huggingface import HuggingFaceEmbeddings
+
+emb = HuggingFaceEmbeddings(model_name="intfloat/multilingual-e5-small",
+                            encode_kwargs={"normalize_embeddings": True})
+sentences = ["concert de jazz", "soirée de musique improvisée", "atelier de poterie"]
+vectors = emb.embed_documents(sentences)          # 3 texts -> 3 vectors
+print("Vector size:", len(vectors[0]))            # each vector = 384 numbers
+print("First 5 numbers:", [round(x, 3) for x in vectors[0][:5]])
+for i in range(1, 3):
+    similarity = sum(a * b for a, b in zip(vectors[0], vectors[i]))   # dot product
+    print(f"'{sentences[0]}' vs '{sentences[i]}': {similarity:.2f}")
+
+# %% K. Inside the model (model card code, with French examples)
+import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModel
+
+def average_pool(last_hidden_states, attention_mask):
+    # one vector per token -> average them -> one vector per text (ignore padding)
+    last_hidden = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
+    return last_hidden.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
+
+input_texts = [
+    "query: concert de jazz",                               # the question
+    "passage: Soirée de musique improvisée au Sunset.",     # a text to search in
+    "passage: Atelier de poterie pour enfants.",            # another text
+]
+tokenizer = AutoTokenizer.from_pretrained("intfloat/multilingual-e5-small")
+model = AutoModel.from_pretrained("intfloat/multilingual-e5-small")
+
+batch = tokenizer(input_texts, max_length=512, padding=True, truncation=True, return_tensors="pt")
+print("Tokens of text 0:", tokenizer.convert_ids_to_tokens(batch["input_ids"][0]))
+
+outputs = model(**batch)
+vecs = F.normalize(average_pool(outputs.last_hidden_state, batch["attention_mask"]), p=2, dim=1)
+print("Shape:", tuple(vecs.shape))                          # (3 texts, 384 numbers)
+print("Question vs passages:", ((vecs[:1] @ vecs[1:].T) * 100).tolist())
+
+# %% L. Same thing in 3 lines with sentence-transformers
+from sentence_transformers import SentenceTransformer
+
+st_model = SentenceTransformer("intfloat/multilingual-e5-small")
+st_vecs = st_model.encode(input_texts, normalize_embeddings=True)
+print("Shape:", st_vecs.shape)
+print("Question vs passages:", (st_vecs[:1] @ st_vecs[1:].T * 100).round(1))
+
+# %% 16. Embedding model, with the e5 prefixes (same as build_index.py)
+embeddings = HuggingFaceEmbeddings(
+    model_name="intfloat/multilingual-e5-small",
+    encode_kwargs={"normalize_embeddings": True, "prompt": "passage: "},
+    query_encode_kwargs={"normalize_embeddings": True, "prompt": "query: "},
+)
+print("Vector size:", len(embeddings.embed_query("concert de jazz")))
+
+# %% 17. Load our chunks and turn 100 of them into LangChain Documents
+import json
+from langchain_core.documents import Document
+
+with open("../data/processed/chunks.json", encoding="utf-8") as f:
+    chunks = json.load(f)
+
+documents = [Document(page_content=c["text"], metadata=c["metadata"]) for c in chunks[:100]]
+print(len(documents), "documents")
+print(documents[0].page_content[:200])
+print(documents[0].metadata)
+
+# %% 18. Tiny demo: FAISS on 3 sentences (demo_ names: do not overwrite ours)
+from langchain_community.vectorstores import FAISS
+
+demo_docs = [
+    Document(page_content="Concert de jazz au Sunset", metadata={"source": "demo1"}),
+    Document(page_content="Atelier de poterie pour enfants", metadata={"source": "demo2"}),
+    Document(page_content="Hello, world!", metadata={"source": "demo3"}),
+]
+demo_store = FAISS.from_documents(demo_docs, embeddings)
+for doc, score in demo_store.similarity_search_with_score("soirée musicale", k=3):
+    print(f"{score:.3f} | {doc.page_content}")
+
+# %% 19. Build a test index on our 100 documents and save it
+vectorstore = FAISS.from_documents(documents, embeddings)
+vectorstore.save_local("../faiss_index_test")
+print("Vectors in index:", vectorstore.index.ntotal)
+print("Index type:", type(vectorstore.index).__name__)
+
+# %% 20. Reload the saved index (no recomputation)
+vectorstore = FAISS.load_local("../faiss_index_test", embeddings,
+                               allow_dangerous_deserialization=True)
+print("Reloaded vectors:", vectorstore.index.ntotal)
+
+# %% 21. Search: the 3 closest chunks to a question
+results = vectorstore.similarity_search_with_score("concert de jazz", k=3)
+for doc, score in results:
+    print(f"{score:.3f} | {doc.metadata['title']}")
+# %% Open the saved index and look inside
+import sys
+sys.path.append("..")                    # so the notebook can import scripts/
+import numpy as np
+from scripts.build_index import load_index
+
+vs = load_index()                        # reads index.faiss + index.pkl
+
+# 1. index.faiss: the vectors
+print(vs.index.ntotal, vs.index.d)       # how many vectors, size of each
+print(vs.index.reconstruct(0)[:5])       # first 5 numbers of vector n°0
+
+# 2. index.pkl: position -> id -> Document
+first_id = vs.index_to_docstore_id[0]
+doc = vs.docstore.search(first_id)
+print(first_id)
+print(doc.page_content[:200])
+print(doc.metadata)
+
+# %% Search by hand: exactly what similarity_search does for us
+q = vs.embeddings.embed_query("concert de jazz")                  # 1. question -> vector
+distances, positions = vs.index.search(np.array([q], dtype="float32"), 3)  # 2. FAISS: 3 closest positions
+print(distances, positions)
+for p in positions[0]:
+    doc = vs.docstore.search(vs.index_to_docstore_id[p])         # 3. position -> id -> Document
+    print(doc.metadata["title"])
+
+# %% The same thing, with LangChain, in one line
+for doc, score in vs.similarity_search_with_score("concert de jazz", k=3):
+    print(f"{score:.3f} | {doc.metadata['title']}")
