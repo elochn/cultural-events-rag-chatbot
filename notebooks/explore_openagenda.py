@@ -635,3 +635,44 @@ for p in positions[0]:
 # %% The same thing, with LangChain, in one line
 for doc, score in vs.similarity_search_with_score("concert de jazz", k=3):
     print(f"{score:.3f} | {doc.metadata['title']}")
+
+# %% 
+from langchain_ollama import ChatOllama
+
+llm = ChatOllama(model="mistral", temperature=0.9)
+response = llm.invoke("Dis bonjour en une phrase.")
+print(response.content)
+
+# %% Chunk statistics
+import json
+import pandas as pd
+
+with open("../data/processed/chunks.json", encoding="utf-8") as f:
+    chunks = json.load(f)
+
+meta = pd.DataFrame([c["metadata"] for c in chunks])   # one row per chunk, one column per metadata
+counts = meta["uid"].value_counts()                     # uid -> how many chunks
+print("Chunks              :", len(meta))
+print("Events              :", counts.size)
+print("Events with 1 chunk :", (counts == 1).sum())
+print("Max chunks per event:", counts.max())
+
+# %% Compare the 3 retrieval versions
+import sys
+sys.path.append("..")
+from datetime import date
+from scripts.build_index import load_index
+
+vectorstore = load_index()
+today = date.today().isoformat()
+question = "Je cherche un concert de jazz."
+
+print("== V1: 5 closest chunks")
+for doc in vectorstore.similarity_search(question, k=5):
+    print(" ", doc.metadata["last_date"][:10], doc.metadata["title"])
+
+print("== V2: + only events not finished")
+for doc in vectorstore.similarity_search(question, k=5, fetch_k=50,
+                                         filter=lambda m: m["last_date"][:10] >= today):
+    print(" ", doc.metadata["last_date"][:10], doc.metadata["title"])
+# %%
