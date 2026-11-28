@@ -18,6 +18,7 @@ distro==1.9.0
 eval_type_backport==0.4.0
 executing==2.3.0
 faiss-cpu==1.16.0
+fastapi==0.165.0
 filelock==4.2.10
 frozenlist==1.8.0
 fsspec==2026.9.0
